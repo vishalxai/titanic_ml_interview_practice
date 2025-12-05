@@ -2,4 +2,6 @@
 *.pyc
 __pycache__
 .DS_Store
-*.csv
+data/processed/
+models/*.joblib
+.env
