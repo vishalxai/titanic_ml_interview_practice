@@ -14,8 +14,9 @@ Run quick check:
 
 from typing import List
 import os
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
@@ -24,6 +25,26 @@ from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 
 from src.features import create_features
+
+
+# -------------------------
+# Module-level wrapper for FE (pickleable)
+# -------------------------
+def _apply_create_features(X):
+    """
+    Wrapper used by FunctionTransformer in pipeline so the function is
+    a proper module-level callable (pickleable).
+    X will be a 2D numpy array or DataFrame depending on how pipeline is used.
+    We call create_features which expects a pandas DataFrame and returns DataFrame.
+    """
+    # If X is already a DataFrame (when called in tests) use it directly; else convert.
+    if isinstance(X, pd.DataFrame):
+        df_in = X
+    else:
+        # if X is numpy array, try to recover column names if present on pandas input
+        # best-effort conversion: convert to DataFrame without column names
+        df_in = pd.DataFrame(X)
+    return create_features(df_in)
 
 
 # -------------------------
@@ -46,6 +67,7 @@ class AgeImputer(BaseEstimator, TransformerMixin):
         X = pd.DataFrame(X).copy()
         # compute median age per title (ignore NaNs)
         if self.title_col in X.columns and self.age_col in X.columns:
+            # convert to series to allow groupby when NaNs present
             self.title_medians_ = X.groupby(self.title_col)[self.age_col].median().to_dict()
             self.global_median_ = X[self.age_col].median()
         else:
@@ -55,19 +77,38 @@ class AgeImputer(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
+        """
+        Vectorized transform:
+         - find rows where Age is missing
+         - map Title -> median
+         - fill missing mapped values with global median
+         - assign back to Age column
+        Returns a DataFrame.
+        """
         X = pd.DataFrame(X).copy()
 
-        def _fill_age(row):
-            if pd.isna(row.get(self.age_col, np.nan)):
-                title = row.get(self.title_col, None)
-                med = self.title_medians_.get(title, None)
-                if pd.isna(med) or med is None:
-                    return self.global_median_
-                return med
-            return row[self.age_col]
+        # if Age column not present, nothing to do
+        if self.age_col not in X.columns:
+            return X
 
-        if self.age_col in X.columns:
-            X[self.age_col] = X.apply(_fill_age, axis=1)
+        missing_mask = X[self.age_col].isna()
+        if not missing_mask.any():
+            return X
+
+        # map titles to medians (NaN where title not in mapping)
+        # guard against missing title column as well
+        if self.title_col in X.columns:
+            mapped = X.loc[missing_mask, self.title_col].map(self.title_medians_)
+        else:
+            # if title column missing, mapped will be all NaN
+            mapped = pd.Series(index=X.loc[missing_mask].index, dtype=float)
+
+        # replace any NaN medians with global median
+        mapped = mapped.fillna(self.global_median_)
+
+        # assign mapped ages into Age column for missing rows
+        X.loc[missing_mask, self.age_col] = mapped
+
         return X
 
 
@@ -131,7 +172,8 @@ def get_preprocessor(
 # -------------------------
 # Full pipeline (feature engineering -> age impute -> columntransformer)
 # -------------------------
-feature_engineering_transformer = FunctionTransformer(lambda X: create_features(pd.DataFrame(X)), validate=False)
+# Use module-level wrapper so transformer is pickleable.
+feature_engineering_transformer = FunctionTransformer(_apply_create_features, validate=False)
 
 # Build final pipeline: FE -> AgeImputer (full DF) -> ColumnTransformer (select columns)
 full_pipeline = Pipeline(
